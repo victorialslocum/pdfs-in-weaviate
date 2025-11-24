@@ -1,0 +1,10 @@
+arxiv
+fastapi
+uvicorn
+weaviate-client[agents]
+python-dotenv
+# part 1
+PyPDF2
+
+# part 2
+docling
