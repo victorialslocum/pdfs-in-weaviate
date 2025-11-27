@@ -1,7 +1,7 @@
 import arxiv
 import os
-from PyPDF2 import PdfReader
-from typing import List
+import pymupdf
+from typing import List, Dict, Any
 import re
 import weaviate
 from weaviate.classes.config import Configure, Property, DataType
@@ -14,7 +14,7 @@ weaviate_url = os.environ["WEAVIATE_URL"]
 weaviate_api_key = os.environ["WEAVIATE_API_KEY"]
 
 
-def download_papers(query="machine learning", max_results=25, download_dir="pdfs"):
+def download_papers(query: str = "machine learning", max_results: int = 25, download_dir: str = "pdfs") -> List[Dict[str, Any]]:
     """
     Downloads a subset of papers from arXiv.
     """
@@ -48,18 +48,16 @@ def download_papers(query="machine learning", max_results=25, download_dir="pdfs
         
     return downloaded_files
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path: str) -> str:
     """
     Extracts text from a PDF file using PyPDF2.
     """
     text = ""
     try:
-        reader = PdfReader(pdf_path)
-        # Extract text from the first few pages to avoid massive output
-        num_pages = min(len(reader.pages), 3) 
-        for i in range(num_pages):
-            page = reader.pages[i]
-            text += page.extract_text() + "\n"
+        doc = pymupdf.open(pdf_path)
+        for page in doc: # iterate the document pages
+            page_text = page.get_text().encode("utf8") # get plain text (is in UTF-8)
+            text += str(page_text)
     except Exception as e:
         print(f"Error reading {pdf_path}: {e}")
         return None
@@ -67,7 +65,7 @@ def extract_text_from_pdf(pdf_path):
     return text
 
 
-def chunk_text(text, doc_id, chunk_size=250, overlap_fraction=0.2):
+def chunk_text(text: str, doc_id: str, chunk_size: int=256, overlap_fraction: float=0.2) -> List[Dict[str, Any]] :
     """
     Uses fixed size chunking with overlap to chunk raw PDF text. Returns a list of chunk objects (doc_id, chunk_id, text).
     """
@@ -76,10 +74,14 @@ def chunk_text(text, doc_id, chunk_size=250, overlap_fraction=0.2):
 
     overlap_int = int(chunk_size * overlap_fraction)
     chunks = []
+    chunk_id = 0
     for i in range(0, len(text_words), chunk_size):
         chunk_words = text_words[max(i - overlap_int, 0): i + chunk_size]
         chunk = " ".join(chunk_words)
-        chunks.append({"chunk_id": i, "doc_id": doc_id, "chunk_text": chunk})
+        chunk_start = max(i - overlap_int, 0)
+        chunk_end = i + chunk_size
+        chunks.append({"chunk_id": chunk_id, "doc_id": doc_id, "chunk_text": chunk, "chunk_start": chunk_start, "chunk_end": chunk_end})
+        chunk_id += 1
 
     return chunks
 
@@ -101,6 +103,9 @@ def main():
                 Property(name="chunk_id", description="The chunk id of the chunk", data_type=DataType.INT, skip_vectorization=True),
                 Property(name="doc_id", description="The UUID of the PDF it belongs to in the ArxivPDFs collection", data_type=DataType.UUID, skip_vectorization=True),
                 Property(name="chunk_text", description="The text of the chunk", data_type=DataType.TEXT),
+                Property(name="start_index", description="The start index of the chunk", data_type=DataType.INT, skip_vectorization=True),
+                Property(name="end_index", description="The end index of the chunk", data_type=DataType.INT, skip_vectorization=True),
+                Property(name="doc_title", description="The title of the PDF it belongs to in the ArxivPDFs collection", data_type=DataType.TEXT),
             ],
         )
     
@@ -115,6 +120,7 @@ def main():
                 Property(name="date", description="The date of the PDF", data_type=DataType.TEXT, skip_vectorization=True),
                 Property(name="authors", description="The authors of the PDF", data_type=DataType.TEXT, skip_vectorization=True),
                 Property(name="file_path", description="The file path of the PDF", data_type=DataType.TEXT, skip_vectorization=True),
+                Property(name="content", description="The content of the PDF (not vectorized)", data_type=DataType.TEXT, skip_vectorization=True),
             ],
         )
 
@@ -139,6 +145,7 @@ def main():
                 "date": pdf_file["date"],
                 "authors": pdf_file["authors"],
                 "file_path": pdf_file["file_path"],
+                "content": pdf_file["content"],
             })
 
             print(doc_uuid, " inserted")
@@ -147,6 +154,7 @@ def main():
             error_threshold = 10  # Max errors before aborting
             with chunks_collection.batch.fixed_size(batch_size=100) as batch:
                 for obj in chunks:
+                    obj["doc_title"] = pdf_file["title"]
                     batch.add_object(properties=obj)
 
                     if batch.number_errors > error_threshold:
@@ -156,8 +164,6 @@ def main():
             if chunks_collection.batch.failed_objects:
                 for failed in chunks_collection.batch.failed_objects[:3]:
                     print(f"Error: {failed.message} for object: {failed.object_}")
-
-            print(i, " chunks inserted")
 
 
     print("\n--- Ingestion Complete ---\n")

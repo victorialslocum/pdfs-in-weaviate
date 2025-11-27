@@ -15,7 +15,7 @@ weaviate_url = os.environ["WEAVIATE_URL"]
 weaviate_api_key = os.environ["WEAVIATE_API_KEY"]
 
 
-def download_papers(query="vector database", max_results=5, download_dir="pdfs"):
+def download_papers(query: str = "vector database", max_results: int = 25, download_dir: str = "pdfs") -> List[dict]:
     """
     Downloads a subset of papers from arXiv.
     """
@@ -49,7 +49,7 @@ def download_papers(query="vector database", max_results=5, download_dir="pdfs")
         
     return downloaded_files
 
-def extract_text_from_pdf(pdf_path):
+def extract_text_from_pdf(pdf_path: str) -> str:
     """
     Extracts text from a PDF file using Docling.
     """
@@ -62,73 +62,103 @@ def extract_text_from_pdf(pdf_path):
     except Exception as e:
         print(f"Error reading {pdf_path}: {e}")
         return None
-    print(text)    
+        
     return text
 
 
-def chunk_text(text, doc_id, chunk_size=250, overlap_fraction=0.2):
+def chunk_text(text: str, doc_id: str, chunk_size: int = 256, overlap_fraction: float = 0.2) -> List[dict]:
     """
-    Uses markdown document-based chunking to chunk raw PDF text. Returns a list of chunk objects (doc_id, chunk_id, text).
+    Uses markdown document-based chunking to chunk raw PDF text. Returns a list of chunk objects (doc_id, chunk_id, text, start_index, end_index).
     """
     # Normalize newlines
     text = text.replace('\r\n', '\n')
     
-    # Split by headers (H1, H2, H3)
-    # Iterate line by line to identify headers and group content
-    lines = text.split('\n')
+    # We need to track the start index of each line
+    lines_with_offsets = []
+    current_idx = 0
+    # splitlines(keepends=True) keeps the newline characters, preserving length
+    for line in text.splitlines(keepends=True):
+        lines_with_offsets.append((line, current_idx))
+        current_idx += len(line)
     
     sections = []
-    current_section = []
+    current_section_lines = []
     
-    for line in lines:
+    for line, start_idx in lines_with_offsets:
         # Check for headers (e.g., "# Header", "## Header")
         if re.match(r'^#{1,3}\s', line):
             # If we have a current section accumulating, save it
-            if current_section:
-                sections.append("\n".join(current_section))
+            if current_section_lines:
+                sections.append({
+                    "lines": current_section_lines,
+                    "start_index": current_section_lines[0][1],
+                    # end index is start of last line + length of last line
+                    "end_index": current_section_lines[-1][1] + len(current_section_lines[-1][0])
+                })
             # Start a new section with the header line
-            current_section = [line]
+            current_section_lines = [(line, start_idx)]
         else:
-            current_section.append(line)
+            current_section_lines.append((line, start_idx))
             
     # Append the last section
-    if current_section:
-        sections.append("\n".join(current_section))
+    if current_section_lines:
+        sections.append({
+            "lines": current_section_lines,
+            "start_index": current_section_lines[0][1],
+            "end_index": current_section_lines[-1][1] + len(current_section_lines[-1][0])
+        })
         
     chunks = []
     chunk_counter = 0
     
     for section in sections:
-        section_text = section.strip()
-        if not section_text:
-            continue
-
-        # Split section into words for size checking
-        # Using simple whitespace splitting as in the original function
-        section_words = re.split(r'\s+', section_text)
+        # Reconstruct section text from lines to find words
+        # We need the exact text of the section to map indices
+        section_raw_text = "".join([l[0] for l in section["lines"]])
+        section_start_abs = section["start_index"]
         
+        # Find words and their spans in the section text
+        # re.finditer returns match objects with .start() and .end()
+        word_matches = list(re.finditer(r'\S+', section_raw_text))
+        section_words = [m.group(0) for m in word_matches]
+        
+        if not section_words:
+            continue
+            
         if len(section_words) <= chunk_size:
             # If section fits in one chunk, add it
+            chunk_text_str = " ".join(section_words)
+            start_offset = word_matches[0].start()
+            end_offset = word_matches[-1].end()
+            
             chunks.append({
                 "chunk_id": chunk_counter,
                 "doc_id": doc_id,
-                "chunk_text": section_text
+                "chunk_text": chunk_text_str,
+                "start_index": section_start_abs + start_offset,
+                "end_index": section_start_abs + end_offset
             })
             chunk_counter += 1
         else:
             # If section is too big, split it with overlap
             overlap_int = int(chunk_size * overlap_fraction)
             for i in range(0, len(section_words), chunk_size - overlap_int):
-                chunk_words = section_words[i : i + chunk_size]
-                if not chunk_words:
+                chunk_word_matches = word_matches[i : i + chunk_size]
+                if not chunk_word_matches:
                     break
                 
-                # Reconstruct text for this chunk
-                chunk_text_sub = " ".join(chunk_words)
+                chunk_words = [m.group(0) for m in chunk_word_matches]
+                chunk_text_str = " ".join(chunk_words)
+                
+                start_offset = chunk_word_matches[0].start()
+                end_offset = chunk_word_matches[-1].end()
+                
                 chunks.append({
                     "chunk_id": chunk_counter,
                     "doc_id": doc_id,
-                    "chunk_text": chunk_text_sub
+                    "chunk_text": chunk_text_str,
+                    "start_index": section_start_abs + start_offset,
+                    "end_index": section_start_abs + end_offset
                 })
                 chunk_counter += 1
 
@@ -138,6 +168,7 @@ def main():
     # 1. Download PDFs
     pdf_files = download_papers()
 
+    # 2. Initialize Weaviate client and collections
     client = weaviate.connect_to_weaviate_cloud(
         cluster_url=weaviate_url,
         auth_credentials=Auth.api_key(weaviate_api_key),
@@ -152,6 +183,9 @@ def main():
                 Property(name="chunk_id", description="The chunk id of the chunk", data_type=DataType.INT, skip_vectorization=True),
                 Property(name="doc_id", description="The UUID of the PDF it belongs to in the ArxivPDFs collection", data_type=DataType.UUID, skip_vectorization=True),
                 Property(name="chunk_text", description="The text of the chunk", data_type=DataType.TEXT),
+                Property(name="doc_title", description="The title of the PDF it belongs to in the ArxivPDFs collection", data_type=DataType.TEXT),
+                Property(name="start_index", description="The start index of the chunk", data_type=DataType.INT, skip_vectorization=True),
+                Property(name="end_index", description="The end index of the chunk", data_type=DataType.INT, skip_vectorization=True),
             ],
         )
     
@@ -166,6 +200,7 @@ def main():
                 Property(name="date", description="The date of the PDF", data_type=DataType.TEXT, skip_vectorization=True),
                 Property(name="authors", description="The authors of the PDF", data_type=DataType.TEXT, skip_vectorization=True),
                 Property(name="file_path", description="The file path of the PDF", data_type=DataType.TEXT, skip_vectorization=True),
+                Property(name="content", description="The content of the PDF", data_type=DataType.TEXT),
             ],
         )
 
@@ -174,7 +209,7 @@ def main():
 
     print("\n--- Extracting Text ---\n")
 
-    # 2. Extract Text
+    # 3. Extract Text
     for pdf_file in pdf_files:
         
         print(f"Processing: {pdf_file['file_path']}")
@@ -190,6 +225,7 @@ def main():
                 "date": pdf_file["date"],
                 "authors": pdf_file["authors"],
                 "file_path": pdf_file["file_path"],
+                "content": pdf_file["content"]
             })
 
             print(doc_uuid, " inserted")
@@ -207,8 +243,6 @@ def main():
             if chunks_collection.batch.failed_objects:
                 for failed in chunks_collection.batch.failed_objects[:3]:
                     print(f"Error: {failed.message} for object: {failed.object_}")
-
-            print(i, " chunks inserted")
 
 
     print("\n--- Ingestion Complete ---\n")
